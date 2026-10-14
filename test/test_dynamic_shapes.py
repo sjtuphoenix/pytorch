@@ -20,8 +20,10 @@ from torch._dynamo.testing import (
     CompileCounter,
     CompileCounterWithBackend,
 )
+from torch._inductor.sizevars import SizeVarAllocator
 from torch._inductor.utils import fresh_cache
 from torch.fx.experimental import sym_node
+from torch.fx.experimental._size_hinting import consistent_hints, ConsistentHintState
 from torch.fx.experimental.proxy_tensor import make_fx
 from torch.fx.experimental.sym_node import method_to_operator, SymNode, to_node
 from torch.fx.experimental.symbolic_shapes import (
@@ -6013,6 +6015,334 @@ def forward(self, arg0_1: "i64[1][1]cpu", arg1_1: "Sym(u1)", arg2_1: "i64[u1][1]
             return a * 10
 
         self.assertRaises(GuardOnDataDependentSymNode, lambda: func(torch.tensor([33])))
+
+    @staticmethod
+    def _make_view_in_storage_symbols(creation_order):
+        """Unbacked "storage", "size" and "offset" with offset + size <= storage,
+        created in creation_order. Returns (sizevars, name -> sympy symbol)."""
+        shape_env = ShapeEnv()
+        syms = {name: shape_env.create_unbacked_symint() for name in creation_order}
+        for s in syms.values():
+            torch._check(s >= 0)
+        torch._check(syms["offset"] + syms["size"] <= syms["storage"])
+        sizevars = SizeVarAllocator(shape_env)
+        return sizevars, {name: s.node.expr for name, s in syms.items()}
+
+    def test_consistent_hints_bound_offset(self):
+        fallback = torch._inductor.config.unbacked_symint_fallback
+        sizevars, s = self._make_view_in_storage_symbols(["storage", "size", "offset"])
+
+        # Hinted independently, the view does not fit its storage.
+        self.assertEqual(sizevars.optimization_hint(s["offset"]), fallback)
+
+        state = ConsistentHintState(sizevars.shape_env)
+        with consistent_hints(state):
+            self.assertEqual(sizevars.optimization_hint(s["storage"]), fallback)
+            self.assertEqual(sizevars.optimization_hint(s["size"]), fallback)
+            self.assertEqual(sizevars.optimization_hint(s["offset"]), 0)
+            self.assertEqual(
+                sizevars.optimization_hint(s["offset"] + s["size"]), fallback
+            )
+
+    def test_consistent_hints_satisfy_assert_in_any_order(self):
+        names = ["storage", "size", "offset"]
+        for creation_order, hint_order, fallback in itertools.product(
+            itertools.permutations(names),
+            itertools.permutations(names),
+            [1, 7, 100, 8192],
+        ):
+            with self.subTest(
+                creation_order=creation_order, hint_order=hint_order, fallback=fallback
+            ):
+                sizevars, s = self._make_view_in_storage_symbols(list(creation_order))
+                state = ConsistentHintState(sizevars.shape_env)
+                with consistent_hints(state):
+                    hints = {
+                        name: sizevars.optimization_hint(s[name], fallback)
+                        for name in hint_order
+                    }
+                self.assertTrue(all(v >= 0 for v in hints.values()), hints)
+                self.assertLessEqual(
+                    hints["offset"] + hints["size"], hints["storage"], hints
+                )
+
+    def test_consistent_hints_assert_keyed_on_known_symbol(self):
+        # storage is the newest symbol, so the assert is keyed on it rather
+        # than on offset, the symbol hinted last.
+        fallback = torch._inductor.config.unbacked_symint_fallback
+        sizevars, s = self._make_view_in_storage_symbols(["offset", "size", "storage"])
+        state = ConsistentHintState(sizevars.shape_env)
+        with consistent_hints(state):
+            self.assertEqual(sizevars.optimization_hint(s["storage"]), fallback)
+            self.assertEqual(sizevars.optimization_hint(s["size"]), fallback)
+            self.assertEqual(sizevars.optimization_hint(s["offset"]), 0)
+
+    def test_consistent_hints_persist_across_contexts(self):
+        fallback = torch._inductor.config.unbacked_symint_fallback
+        sizevars, s = self._make_view_in_storage_symbols(["storage", "size", "offset"])
+        state = ConsistentHintState(sizevars.shape_env)
+        with consistent_hints(state):
+            sizevars.optimization_hint(s["storage"])
+            sizevars.optimization_hint(s["size"])
+        # Outside the context, hints are independent again.
+        self.assertEqual(sizevars.optimization_hint(s["offset"]), fallback)
+        with consistent_hints(state):
+            self.assertEqual(sizevars.optimization_hint(s["offset"]), 0)
+
+    def test_consistent_hints_cache(self):
+        fallback = torch._inductor.config.unbacked_symint_fallback
+        sizevars, s = self._make_view_in_storage_symbols(["storage", "size", "offset"])
+        view_end = s["offset"] + s["size"]
+        state = ConsistentHintState(sizevars.shape_env)
+        with consistent_hints(state):
+            sizevars.optimization_hint(s["storage"])
+            sizevars.optimization_hint(s["size"])
+            self.assertEqual(sizevars.optimization_hint(view_end), fallback)
+            self.assertIn((view_end, None), state.cache)
+            self.assertEqual(sizevars.optimization_hint(view_end), fallback)
+        # A new symbol getting a value clears cached results.
+        u = sizevars.shape_env.create_unbacked_symint().node.expr
+        with consistent_hints(state):
+            sizevars.optimization_hint(u)
+            self.assertNotIn((view_end, None), state.cache)
+            self.assertEqual(sizevars.optimization_hint(view_end), fallback)
+
+    def test_consistent_hints_docstring_example(self):
+        shape_env = ShapeEnv()
+        u0, u1, u2 = (shape_env.create_unbacked_symint() for _ in range(3))
+        for u in (u0, u1, u2):
+            torch._check(u >= 0)
+        torch._check(u0 + u1 <= u2)
+        sizevars = SizeVarAllocator(shape_env)
+        symbols = [u.node.expr for u in (u0, u1, u2)]
+
+        u0, u1, u2 = symbols
+
+        self.assertEqual(sizevars.optimization_hint(u0 + u1, fallback=100), 200)
+        self.assertEqual(sizevars.optimization_hint(u2, fallback=100), 100)
+        state = ConsistentHintState(sizevars.shape_env)
+        with consistent_hints(state):
+            # u0 + u1 is decomposed into u0 and u1, each hinted in isolation.
+            self.assertEqual(sizevars.optimization_hint(u0 + u1, fallback=100), 200)
+            self.assertEqual(sizevars.optimization_hint(u2, fallback=100), 200)
+            self.assertEqual(
+                state.assignments,
+                {u0: 100, u1: 100, u2: 200},
+            )
+
+    def test_consistent_hints_eq_bounded_before_other_symbol_known(self):
+        for eq_first, hint_order, fallback in itertools.product(
+            [False, True], [("u0", "u1"), ("u1", "u0")], [1, 50, 100, 8192]
+        ):
+            with self.subTest(
+                eq_first=eq_first, hint_order=hint_order, fallback=fallback
+            ):
+                shape_env = ShapeEnv()
+                syms = {
+                    name: shape_env.create_unbacked_symint() for name in ("u0", "u1")
+                }
+                # With the Eq checked first, ShapeEnv cannot refine u0's range
+                # from u1 > 1 at check time, so the bound must come from hinting.
+                if eq_first:
+                    torch._check(syms["u0"] + syms["u1"] == 100)
+                torch._check(syms["u0"] > 0)
+                torch._check(syms["u1"] > 1)
+                if not eq_first:
+                    torch._check(syms["u0"] + syms["u1"] == 100)
+                sizevars = SizeVarAllocator(shape_env)
+                state = ConsistentHintState(shape_env)
+                with consistent_hints(state):
+                    hints = {
+                        name: sizevars.optimization_hint(syms[name].node.expr, fallback)
+                        for name in hint_order
+                    }
+                # The first symbol is bounded by 100 minus the other's minimum
+                # before the other has a value: u0 <= 98, u1 <= 99.
+                first = hint_order[0]
+                self.assertLessEqual(hints[first], 98 if first == "u0" else 99)
+                self.assertGreater(hints["u0"], 0)
+                self.assertGreater(hints["u1"], 1)
+                self.assertEqual(hints["u0"] + hints["u1"], 100)
+
+    def test_consistent_hints_eq_sum_of_four_any_order(self):
+        names = ["u0", "u1", "u2", "u3"]
+        for eq_first, hint_order, fallback in itertools.product(
+            [False, True], itertools.permutations(names), [1, 30, 8192]
+        ):
+            with self.subTest(
+                eq_first=eq_first, hint_order=hint_order, fallback=fallback
+            ):
+                shape_env = ShapeEnv()
+                syms = {name: shape_env.create_unbacked_symint() for name in names}
+                total = sum(syms.values())
+                if eq_first:
+                    torch._check(total == 100)
+                for s in syms.values():
+                    torch._check(s >= 1)
+                if not eq_first:
+                    torch._check(total == 100)
+                sizevars = SizeVarAllocator(shape_env)
+                state = ConsistentHintState(shape_env)
+                with consistent_hints(state):
+                    hints = {
+                        name: sizevars.optimization_hint(syms[name].node.expr, fallback)
+                        for name in hint_order
+                    }
+                self.assertTrue(all(v >= 1 for v in hints.values()), hints)
+                self.assertEqual(sum(hints.values()), 100, hints)
+
+    def test_consistent_hints_keep_eq_canonicalization(self):
+        # Per-symbol bounds skip the non-linear Eq, but the existing Eq
+        # canonicalization still rewrites u0 * u1 to 100, inside the context too.
+        shape_env = ShapeEnv()
+        u0, u1 = (shape_env.create_unbacked_symint() for _ in range(2))
+        torch._check(u0 >= 1)
+        torch._check(u1 >= 1)
+        torch._check(u0 * u1 == 100)
+        sizevars = SizeVarAllocator(shape_env)
+        product = u0.node.expr * u1.node.expr
+        self.assertEqual(sizevars.optimization_hint(product), 100)
+        state = ConsistentHintState(shape_env)
+        with consistent_hints(state):
+            sizevars.optimization_hint(u0.node.expr)
+            sizevars.optimization_hint(u1.node.expr)
+            self.assertEqual(sizevars.optimization_hint(product), 100)
+
+    @staticmethod
+    def _make_unbacked(n, lower=0):
+        shape_env = ShapeEnv()
+        syms = [shape_env.create_unbacked_symint() for _ in range(n)]
+        if lower is not None:
+            for s in syms:
+                torch._check(s >= lower)
+        return shape_env, syms
+
+    def test_consistent_hints_eq_partial_rewrite(self):
+        # Eq(u0 + u1, 100) rewrites u0 + u1 inside u0 + u1 + u2, so only u2
+        # gets a value.
+        shape_env, (u0, u1, u2) = self._make_unbacked(3)
+        torch._check(u0 + u1 == 100)
+        sizevars = SizeVarAllocator(shape_env)
+        a, b, c = (u.node.expr for u in (u0, u1, u2))
+        state = ConsistentHintState(shape_env)
+        with consistent_hints(state):
+            self.assertEqual(sizevars.optimization_hint(a + b + c, 30), 130)
+            self.assertEqual(state.assignments, {c: 30})
+
+    def test_consistent_hints_eq_scaled_sum(self):
+        shape_env, (u0, u1) = self._make_unbacked(2)
+        torch._check(u0 + u1 == 100)
+        sizevars = SizeVarAllocator(shape_env)
+        a, b = u0.node.expr, u1.node.expr
+        state = ConsistentHintState(shape_env)
+        with consistent_hints(state):
+            self.assertEqual(sizevars.optimization_hint(10 * a + 10 * b), 1000)
+            self.assertEqual(
+                sizevars.optimization_hint(a) + sizevars.optimization_hint(b), 100
+            )
+
+    def test_consistent_hints_eq_subset_of_sum(self):
+        shape_env, (u0, u1, u2) = self._make_unbacked(3)
+        torch._check(u0 + u1 + u2 == 100)
+        sizevars = SizeVarAllocator(shape_env)
+        a, b, c = (u.node.expr for u in (u0, u1, u2))
+        # Independently, each of u0 and u1 hints to its range max 100, so
+        # u0 + u1 = 200 leaves no room for u2.
+        self.assertGreater(sizevars.optimization_hint(a + b), 100)
+        state = ConsistentHintState(shape_env)
+        with consistent_hints(state):
+            ab = sizevars.optimization_hint(a + b)
+            self.assertLessEqual(ab, 100)
+            self.assertEqual(ab + sizevars.optimization_hint(c), 100)
+
+    def test_consistent_hints_eq_without_lower_bounds(self):
+        # Without a finite lower bound on u1, satisfying the Eq can make it
+        # negative; documents current behavior.
+        fallback = torch._inductor.config.unbacked_symint_fallback
+        shape_env, (u0, u1) = self._make_unbacked(2, lower=None)
+        torch._check(u0 + u1 == 100)
+        sizevars = SizeVarAllocator(shape_env)
+        state = ConsistentHintState(shape_env)
+        with consistent_hints(state):
+            h0 = sizevars.optimization_hint(u0.node.expr)
+            h1 = sizevars.optimization_hint(u1.node.expr)
+        self.assertEqual(h0 + h1, 100)
+        self.assertEqual(h0, fallback)
+        self.assertLess(h1, 0)
+
+    def test_consistent_hints_nonlinear_eq_with_override(self):
+        # Eq(a * b * c, 10) with a overridden to 100 has no integer solution.
+        # b is hinted while c is unknown, so the non-linear assert gives no
+        # bound and b keeps the fallback. Then the assert is linear in c,
+        # 819200 * c == 10, whose range [1, 0] is empty, so c gets its lower
+        # bound 1. The Eq canonicalization still hints a * b * c as 10.
+        fallback = torch._inductor.config.unbacked_symint_fallback
+        shape_env, (a, b, c) = self._make_unbacked(3, lower=1)
+        torch._check(a * b * c == 10)
+        shape_env._set_unbacked_var_to_hint_override(a, 100)
+        sizevars = SizeVarAllocator(shape_env)
+        x, y, z = (u.node.expr for u in (a, b, c))
+        state = ConsistentHintState(shape_env)
+        with consistent_hints(state):
+            hints = [sizevars.optimization_hint(u) for u in (x, y, z)]
+            product = sizevars.optimization_hint(x * y * z)
+        self.assertEqual(hints, [100, fallback, 1])
+        self.assertEqual(product, 10)
+
+    def test_optimization_hint_hint_override_in_asserts(self):
+        shape_env = ShapeEnv()
+        u0, u1 = (shape_env.create_unbacked_symint() for _ in range(2))
+        torch._check(u0 >= 0)
+        torch._check(u1 >= 0)
+        torch._check(u1 <= u0)
+        shape_env._set_unbacked_var_to_hint_override(u0, 16)
+        sizevars = SizeVarAllocator(shape_env)
+        self.assertEqual(sizevars.optimization_hint(u1.node.expr), 16)
+
+    def test_consistent_hints_hint_override(self):
+        shape_env = ShapeEnv()
+        u0, u1, u2 = (shape_env.create_unbacked_symint() for _ in range(3))
+        for u in (u0, u1, u2):
+            torch._check(u >= 0)
+        torch._check(u0 + u1 <= u2)
+        shape_env._set_unbacked_var_to_hint_override(u2, 150)
+        sizevars = SizeVarAllocator(shape_env)
+        state = ConsistentHintState(sizevars.shape_env)
+        with consistent_hints(state):
+            self.assertEqual(sizevars.optimization_hint(u0.node.expr, 100), 100)
+            # u2 is never hinted here; its override still bounds u1.
+            self.assertEqual(sizevars.optimization_hint(u1.node.expr, 100), 50)
+
+    def test_consistent_hints_applies_to_shape_env_optimization_hint(self):
+        shape_env = ShapeEnv()
+        u0, u1, u2 = (shape_env.create_unbacked_symint() for _ in range(3))
+        for u in (u0, u1, u2):
+            torch._check(u >= 0)
+        torch._check(u0 + u1 <= u2)
+        sizevars = SizeVarAllocator(shape_env)
+        symbols = [u.node.expr for u in (u0, u1, u2)]
+        state = ConsistentHintState(sizevars.shape_env)
+        with consistent_hints(state):
+            self.assertEqual(
+                [shape_env.optimization_hint(u, fallback=100) for u in symbols],
+                [100, 100, 200],
+            )
+        self.assertEqual(shape_env.optimization_hint(symbols[2], fallback=100), 100)
+
+    def test_consistent_hints_eq(self):
+        shape_env = ShapeEnv()
+        a, b = (shape_env.create_unbacked_symint() for _ in range(2))
+        torch._check(a >= 0)
+        torch._check(b >= 0)
+        torch._check(a + b == 100)
+        sizevars = SizeVarAllocator(shape_env)
+        a, b = a.node.expr, b.node.expr
+
+        state = ConsistentHintState(sizevars.shape_env)
+        with consistent_hints(state):
+            self.assertEqual(sizevars.optimization_hint(a, fallback=30), 30)
+            self.assertEqual(sizevars.optimization_hint(b, fallback=30), 70)
+            self.assertEqual(sizevars.optimization_hint(a + b, fallback=30), 100)
 
     @skipIfTorchDynamo("mark_unbacked is not traceable")
     def test_shape_id_unifies_unbacked_symbols(self):
