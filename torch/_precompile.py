@@ -251,7 +251,7 @@ it.
 from __future__ import annotations
 
 import base64
-import contextlib  # noqa: TC003
+import contextlib
 import dataclasses
 import errno
 import functools
@@ -297,7 +297,6 @@ log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
-    from contextlib import AbstractContextManager
     from typing_extensions import Self
 
     from torch._dynamo.precompile_package import PrecompileSession
@@ -716,7 +715,7 @@ class _DynamoCapture(Capture[_P, _R]):
             "require_no_risky_drops": require_no_risky_drops,
         }
         self._call: Callable[..., object] | None = None
-        self._fresh_cache: AbstractContextManager[None] | None = None
+        self._block = contextlib.ExitStack()
         self._in_call = False
         self._calls = 0
         # The call count the last save() wrote. -1, not 0, so a block that never
@@ -734,19 +733,20 @@ class _DynamoCapture(Capture[_P, _R]):
 
     def _start(self) -> None:
         from torch.compiler._cache import CacheArtifactManager
+        from torch.compiler._runtime_cache import capture_scope
 
         # The capture's compiles record into the process-global cache-artifact
         # list, which the cache half of the artifact bundles to prime the
         # kernel caches on load. A fresh one so the bundle holds only this
         # capture's compiles; left in _finish. The swap spans the whole
-        # block, so anything else compiled inside the block records here too.
-        self._fresh_cache = CacheArtifactManager.with_fresh_cache()
-        self._fresh_cache.__enter__()
+        # block, so anything else compiled inside the block records here too,
+        # as it does into the runtime scope whose dependencies _write freezes.
         try:
+            self._block.enter_context(capture_scope())
+            self._block.enter_context(CacheArtifactManager.with_fresh_cache())
             self._call = self._map(self._session.__enter__)
         except BaseException:
-            self._fresh_cache.__exit__(None, None, None)
-            self._fresh_cache = None
+            self._block.close()
             raise
 
     def _run(self, *args: _P.args, **kwargs: _P.kwargs) -> _R:
@@ -767,15 +767,38 @@ class _DynamoCapture(Capture[_P, _R]):
         finally:
             self._in_call = False
 
-    def _write(self) -> None:
-        rendered = self._map(self._session.snapshot_artifact, **self._gates)
+    def _write(self, *, final: bool = False) -> None:
+        from torch.compiler._runtime_cache import freeze_runtime_cache
+
+        python_code, cache = self._map(self._session.snapshot_artifact, **self._gates)
+        blob = torch.load(io.BytesIO(cache), weights_only=True)
+
+        def write(artifact: bytes | None) -> None:
+            buf = io.BytesIO()
+            torch.save({**blob, "artifact": artifact}, buf)
+            _write_artifact(
+                self._artifact_path, self._cache_path, python_code, buf.getvalue()
+            )
+
         try:
-            _write_artifact(self._artifact_path, self._cache_path, *rendered)
+            freeze_runtime_cache(
+                blob["artifact"],
+                write,
+                final=final,
+                compiled=blob["backend"] != "eager",
+            )
         except OSError as e:
             # Only the on-disk rewrite failed; _write_artifact leaves whatever
             # pair was already at these paths in place.
             raise PrecompileError(
                 f"precompile could not write the artifact: {e}"
+            ) from e
+        except PrecompileError:
+            raise
+        except Exception as e:
+            raise PrecompileError(
+                "precompile could not freeze the runtime dependencies of "
+                f"cache_path={os.fspath(self._cache_path)!r}: {e}"
             ) from e
         self._saved_calls = self._calls
 
@@ -807,9 +830,13 @@ class _DynamoCapture(Capture[_P, _R]):
                             "nothing was captured: call the capture with your "
                             "example arguments inside the `with` block."
                         )
-                    self._write()
+                    self._write(final=True)
                 except BaseException as e:
                     error = e
+            elif exc[0] is None:
+                from torch.compiler._runtime_cache import seal_runtime_scope
+
+                seal_runtime_scope()
             try:
                 self._map(self._session.__exit__, *exc)
             except BaseException as e:
@@ -817,9 +844,7 @@ class _DynamoCapture(Capture[_P, _R]):
                     raise
                 raise e from error
         finally:
-            if self._fresh_cache is not None:
-                self._fresh_cache.__exit__(None, None, None)
-                self._fresh_cache = None
+            self._block.close()
         if exc[0] is None and error is not None:
             raise error
 
@@ -2257,6 +2282,9 @@ def _build_multigraph_python_source(
     buf.writeline("# " + "=" * 70)
     buf.writeline("# 1. What was captured (readable)")
     buf.writeline("# " + "=" * 70)
+    # _read_runtime_cache_envelope reads these two lines without executing the
+    # artifact: they must stay the first statements, one line each, preceded only
+    # by comments and blank lines.
     buf.writeline(f"BACKEND = {backend!r}")
     buf.writeline('TRACER = "dynamo"')
     buf.writeline(f'SERVING_MODE = "{mode}"')
@@ -3040,6 +3068,7 @@ def _verified_cache_envelope(
     tracer: str,
     code_hash: str,
     strict: bool,
+    caller: str | None = None,
 ) -> dict[str, Any] | None:
     # weights_only=True is safe (plain str/int/bytes dict). Outside strict mode the
     # cache is acceleration only, so an unreadable envelope or a FORMAT / VERSION
@@ -3047,12 +3076,14 @@ def _verified_cache_envelope(
     # is forbidden, so the same conditions raise instead. A BACKEND, TRACER or
     # CODE_HASH mismatch signals a wrong (python_code, cache) pairing and always
     # raises; see Note [precompile programming model], invariant 7.
+    mismatch = f"{caller}: " if caller else ""
+    caller = caller or "strict precompile.load"
     try:
         blob = torch.load(io.BytesIO(cache), weights_only=True)
         if blob.get("format") != _CACHE_FORMAT or blob.get("version") != _CACHE_VERSION:
             if strict:
                 raise PrecompileError(
-                    "strict precompile.load requires a compatible cache envelope; "
+                    f"{caller} requires a compatible cache envelope; "
                     f"got format={blob.get('format')!r}, "
                     f"version={blob.get('version')!r}, "
                     f"expected {_CACHE_FORMAT!r}, {_CACHE_VERSION!r}."
@@ -3069,19 +3100,19 @@ def _verified_cache_envelope(
             return None
         if blob.get("backend") != backend:
             raise PrecompileError(
-                f"cache backend {blob.get('backend')!r} does not match the "
+                f"{mismatch}cache backend {blob.get('backend')!r} does not match the "
                 f"python_code backend {backend!r}; the cache and python_code "
                 "came from different precompile captures."
             )
         if blob.get("tracer", "make_fx") != tracer:
             raise PrecompileError(
-                f"cache tracer {blob.get('tracer', 'make_fx')!r} does not match "
+                f"{mismatch}cache tracer {blob.get('tracer', 'make_fx')!r} does not match "
                 f"the python_code tracer {tracer!r}; the cache and python_code "
                 "came from different precompile captures."
             )
         if blob.get("code_hash") != code_hash:
             raise PrecompileError(
-                "cache does not match python_code (its code_hash "
+                f"{mismatch}cache does not match python_code (its code_hash "
                 f"{blob.get('code_hash')!r} != sha256(python_code) "
                 f"{code_hash!r}); the cache and python_code came from "
                 "different precompile captures. Pair each cache with the "
@@ -3092,9 +3123,7 @@ def _verified_cache_envelope(
         raise
     except Exception as e:
         if strict:
-            raise PrecompileError(
-                "strict precompile.load could not read the cache envelope"
-            ) from e
+            raise PrecompileError(f"{caller} could not read the cache envelope") from e
         log.warning(
             "torch.compiler.precompile could not read the cache envelope (%s: %s); the "
             "cache is likely corrupt or from a different torch build. Falling back "
@@ -3103,6 +3132,96 @@ def _verified_cache_envelope(
             e,
         )
         return None
+
+
+def _runtime_cache_pair(
+    artifact_path: str | os.PathLike[str], cache_path: str | os.PathLike[str]
+) -> str:
+    return (
+        f"(artifact_path={os.fspath(artifact_path)!r}, "
+        f"cache_path={os.fspath(cache_path)!r})"
+    )
+
+
+def _read_runtime_cache_envelope(
+    artifact_path: str | os.PathLike[str],
+    cache_path: str | os.PathLike[str],
+    operation: str,
+) -> dict[str, Any]:
+    """Verify a Dynamo pair's identity without materializing or executing the program.
+
+    Only the BACKEND / TRACER header lines that _emit_multigraph_driver_source
+    writes are parsed; the rest of the source is streamed into the code hash.
+    """
+    import ast
+
+    pair = _runtime_cache_pair(artifact_path, cache_path)
+
+    def unsupported() -> PrecompileError:
+        return PrecompileError(
+            f"precompile.{operation} {pair} supports only Dynamo captures (make_fx "
+            "captures are not supported), and the artifact has no generated Dynamo "
+            "artifact header"
+        )
+
+    digest = hashlib.sha256()
+    metadata = {}
+    header_size = 0
+    try:
+        with open(artifact_path, "rb") as source:
+            for expected in ("BACKEND", "TRACER"):
+                while True:
+                    line = source.readline(65537)
+                    header_size += len(line)
+                    if not line or header_size > 65536:
+                        raise unsupported()
+                    digest.update(line)
+                    if line.strip() and not line.lstrip().startswith(b"#"):
+                        break
+                try:
+                    statements = ast.parse(line.decode("utf-8")).body
+                    if len(statements) != 1 or not isinstance(
+                        statements[0], ast.Assign
+                    ):
+                        raise ValueError("Expected an artifact metadata assignment")
+                    assignment = statements[0]
+                    if len(assignment.targets) != 1 or not isinstance(
+                        assignment.targets[0], ast.Name
+                    ):
+                        raise ValueError("Expected one metadata name")
+                    if assignment.targets[0].id != expected:
+                        raise ValueError(f"Expected {expected}")
+                    value = ast.literal_eval(assignment.value)
+                    if not isinstance(value, str):
+                        raise ValueError("Expected string metadata")
+                    metadata[expected] = value
+                except (SyntaxError, ValueError) as exc:
+                    raise unsupported() from exc
+            if metadata["TRACER"] != "dynamo":
+                raise PrecompileError(
+                    f"precompile.{operation} {pair} supports only Dynamo captures, "
+                    f"and the artifact was captured with the {metadata['TRACER']!r} "
+                    "tracer"
+                )
+            while chunk := source.read(1024 * 1024):
+                digest.update(chunk)
+        with open(cache_path, "rb") as f:
+            cache = f.read()
+    except OSError as e:
+        raise PrecompileError(
+            f"precompile.{operation} could not read the artifact pair {pair}: {e}"
+        ) from e
+    blob = _verified_cache_envelope(
+        cache,
+        backend=metadata["BACKEND"],
+        tracer=metadata["TRACER"],
+        code_hash=digest.hexdigest(),
+        strict=True,
+        caller=f"precompile.{operation} {pair}",
+    )
+    if blob is None:
+        raise AssertionError("a strict envelope read returns the envelope or raises")
+    return blob
 
 
 def no_compilation() -> contextlib.AbstractContextManager[None]:
@@ -3131,6 +3250,80 @@ def no_compilation() -> contextlib.AbstractContextManager[None]:
     from torch.compiler._no_compile import no_compilation as _no_compilation
 
     return _no_compilation()
+
+
+def capture_runtime() -> contextlib.AbstractContextManager[None]:
+    """
+    Record runtime dependencies from earlier than :func:`capture`, and seal after it.
+
+    A :class:`DynamoTracer` capture freezes the runtime dependencies compiled
+    while its block is open into ``cache_path`` on its own. Wrap the producer in
+    ``capture_runtime()`` when the application compiles before the block, or to
+    check that nothing compiles once the cache is written. Enter it before the
+    application imports and compiles anything, and exit it only after the
+    application's own cleanup has returned::
+
+        with torch.compiler.precompile.capture_runtime():
+            warm_up_application()  # recorded too
+            with torch.compiler.precompile.capture(
+                fn, artifact_path="m.py", cache_path="m.cache"
+            ) as cap:
+                cap(model, x)
+            shutdown_application()  # raises if it would still compile
+
+    The scope records from its entry, and the capture inside it seals it once
+    the capture's final write succeeds: from then until the scope exits,
+    compilation is forbidden as under :func:`no_compilation`, so any compile the
+    written cache would not cover raises :class:`~torch.compiler.PrecompileError`
+    instead of passing silently. A sealed scope takes no second capture.
+
+    Raises :class:`~torch.compiler.PrecompileError` if entered while compilation
+    is already forbidden, or while this process already has an active scope or
+    an open capture. A scope inherited across ``fork`` belongs to the parent and
+    does not block the child.
+    """
+    from torch.compiler._runtime_cache import capture_runtime as _capture_runtime
+
+    return _capture_runtime()
+
+
+def prepare_runtime(
+    *, artifact_path: str | os.PathLike[str], cache_path: str | os.PathLike[str]
+) -> None:
+    """
+    Install a capture's runtime dependencies before the application starts.
+
+    :func:`load` installs them itself, so call this only when the serving worker
+    compiles before it loads the pair: early, before the application imports
+    anything that compiles::
+
+        torch.compiler.precompile.prepare_runtime(
+            artifact_path="m.py", cache_path="m.cache"
+        )
+        import application  # compiles against the installed dependencies
+
+        runnable = torch.compiler.precompile.load("m.py", "m.cache")
+
+    It verifies that the pair matches by streaming the artifact's bytes into its
+    hash, without executing the artifact or initializing CUDA. It runs under
+    :func:`no_compilation`. Only Dynamo captures are supported.
+
+    Raises :class:`~torch.compiler.PrecompileError` for a make_fx capture or a
+    mismatched or unreadable pair.
+    """
+    from torch.compiler._runtime_cache import prepare_runtime_cache
+
+    with no_compilation():
+        blob = _read_runtime_cache_envelope(
+            artifact_path, cache_path, "prepare_runtime"
+        )
+        try:
+            prepare_runtime_cache(blob.get("artifact"))
+        except Exception as exc:
+            raise PrecompileError(
+                "precompile.prepare_runtime: Could not prepare precompile runtime "
+                f"dependencies for cache_path={os.fspath(cache_path)!r}: {exc}"
+            ) from exc
 
 
 def _runnable_from_pair(
