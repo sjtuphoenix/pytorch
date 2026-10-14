@@ -3277,10 +3277,26 @@ def capture_runtime() -> contextlib.AbstractContextManager[None]:
     written cache would not cover raises :class:`~torch.compiler.PrecompileError`
     instead of passing silently. A sealed scope takes no second capture.
 
+    When Triton is installed, set a ``TRITON_CACHE_DIR`` dedicated to this capture
+    and ``TRITON_CACHE_AUTOTUNING=1`` before entering, so the capture can carry
+    kernels launched directly through ``@triton.jit`` / ``@triton.autotune`` and
+    their autotuning decisions. Everything in that directory is shipped, so do
+    not share it with unrelated work. A capture that never starts a GPU runtime
+    (CUDA or XPU) needs neither setting. A plain :func:`capture` carries that
+    cache too when both settings are present, and leaves it out, with a warning
+    when ``TRITON_CACHE_DIR`` is set, instead of raising.
+    Triton does not cache the decision of an autotuner with ``pre_hook``
+    configs, so such a kernel is benchmarked again on first use.
+
     Raises :class:`~torch.compiler.PrecompileError` if entered while compilation
-    is already forbidden, or while this process already has an active scope or
-    an open capture. A scope inherited across ``fork`` belongs to the parent and
-    does not block the child.
+    is already forbidden, while this process already has an active scope or an
+    open capture, or, with Triton installed, for an invalid ``TRITON_CACHE_DIR``,
+    for a missing one once a GPU runtime has started, or with Triton's
+    autotuning cache disabled while ``TRITON_CACHE_DIR`` is set. The capture
+    inside it raises when ``TRITON_CACHE_DIR`` changed since the scope was
+    entered, or when it started a GPU runtime although the scope was entered
+    without ``TRITON_CACHE_DIR``. A scope inherited across ``fork`` belongs to
+    the parent and does not block the child.
     """
     from torch.compiler._runtime_cache import capture_runtime as _capture_runtime
 
@@ -3318,9 +3334,23 @@ def prepare_runtime(
     must install PyTorch and its toolchain at the producer's paths, or the kernel
     misses and is compiled on the serving host.
 
+    A cache that carries Triton's runtime cache has it imported here, into this
+    process's ``TRITON_CACHE_DIR``; :func:`load` does not import it again. Enable
+    Triton's autotuning cache (``TRITON_CACHE_AUTOTUNING=1``) before calling it,
+    so the captured autotuning decisions are reused instead of re-benchmarked.
+    ``prepare_runtime`` is for strict serving, so it raises when that cache
+    cannot be imported or Triton's autotuning cache is disabled. A worker
+    that serves without :func:`no_compilation` can skip it: :func:`load` then
+    logs a warning and Triton compiles or autotunes those kernels on first use.
+    Give each captured cache its own ``TRITON_CACHE_DIR``, empty before its first
+    import: a directory that already holds a different Triton runtime cache is
+    rejected, so a second cache imported into it raises here and warns in
+    :func:`load`.
+
     Raises :class:`~torch.compiler.PrecompileError` for a make_fx capture, a
-    mismatched or unreadable pair, or a cache whose capture did not freeze its
-    runtime dependencies.
+    mismatched or unreadable pair, a cache whose capture did not freeze its
+    runtime dependencies, or a cache carrying a Triton runtime cache that cannot
+    be imported or that Triton's disabled autotuning cache would ignore.
     """
     from torch.compiler._runtime_cache import prepare_runtime_cache
 
